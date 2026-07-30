@@ -1,188 +1,94 @@
-# ---------------------------------------------------------------------------
 # Aviator Verify — preview-environment image for umami
-# ---------------------------------------------------------------------------
 #
-# This is NOT a container that runs the app. It is a PRE-WARMED MACHINE.
-# Aviator boots an e2b microVM from this image, fetches the runbook branch into
-# /code, then runs .aviator/scripts/preview-setup.sh inside it to start the
-# server. A headless browser on Aviator's own infrastructure drives the app over
-# the public internet.
+# A pre-warmed machine, not a container that runs the app: Aviator boots an e2b
+# microVM from this, fetches the runbook branch into /code, then runs
+# .aviator/scripts/preview-setup.sh to start the server. Playwright runs on
+# Aviator's side, so no browser is needed here.
 #
-# Consequences:
-#   * No CMD / ENTRYPOINT — Aviator never runs this container normally.
-#   * No COPY / ADD — this file is pasted into Aviator's "Add Custom Template"
-#     screen, which has no build context and rejects them.
-#   * No Chrome / Playwright — the browser lives on Aviator's side.
+# No CMD/ENTRYPOINT (never run as a container), no COPY/ADD (pasted into the UI,
+# which has no build context and rejects them).
 #
-# This file is documentation. Aviator does not read it from the repo; the built
-# template lives on e2b. Editing it here changes nothing until it is re-pasted
-# and rebuilt.
-#
-# HOW THE CACHING WORKS
-#
-# At launch Aviator cleans the tree with `git reset --hard` + `git clean -fd`.
-# There is no `-x`, so GITIGNORED PATHS SURVIVE. umami is a good fit — every
-# expensive artifact is already gitignored (see .gitignore):
-#
-#   node_modules      pnpm dependencies (incl. the prisma engines)
-#   /.next            the Next.js build output and its build cache
-#   /generated        the esbuild-bundled prisma client
-#   /src/generated    prisma generate output
-#   /geo              the GeoLite2-City database
-#   /public/script.js the rollup-built tracker
-#   /public/recorder.js the rollup-built session recorder
-#
-# The PostgreSQL cluster lives at /var/lib/postgresql, entirely OUTSIDE /code,
-# so git never touches it at all — the migrated schema and the seeded demo
-# analytics survive every launch for free.
-# ---------------------------------------------------------------------------
+# Caching: the launch cleans with `git clean -fd` and no -x, so gitignored paths
+# survive — node_modules, /.next, /generated, /geo, /public/script.js,
+# /public/recorder.js. The PostgreSQL cluster lives at /var/lib/postgresql,
+# outside /code, so git never touches it at all.
 
-# Debian, not alpine (the repo's own runtime Dockerfile uses node:22-alpine).
-# We need apt for PostgreSQL, and node:22-bookworm puts node/npm/npx in
-# /usr/local/bin, which IS on e2b's forced PATH. Node 22 matches CI
-# (.github/workflows -> node-version: 22).
 FROM node:22-bookworm
 
 ARG DEBIAN_FRONTEND=noninteractive
 
-# ---------------------------------------------------------------------------
-# System packages
-# ---------------------------------------------------------------------------
-#   git / git-lfs   Aviator checks out the runbook branch in /code
-#   postgresql      umami has no sqlite path — @prisma/adapter-pg only speaks
-#                   postgres, and scripts/check-db.js hard-fails below server
-#                   version 9.4. Debian bookworm ships PostgreSQL 15, matching
-#                   the repo's own docker-compose.yml (postgres:15-alpine).
-#   postgresql-client  psql, used by the setup script to set the admin password
-#
-# npm is already present (node base image) — Aviator appends
-# `npm install -g @anthropic-ai/claude-code` when it builds a Dockerfile-sourced
-# template, and that step dies on a base image with no Node.
+# postgresql: umami has no sqlite path (@prisma/adapter-pg only speaks postgres).
+# git/git-lfs: Aviator checks out the runbook branch in /code.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         git git-lfs ca-certificates curl \
         postgresql postgresql-client \
     && rm -rf /var/lib/apt/lists/*
 
-# The repo is a pnpm workspace (pnpm-workspace.yaml + pnpm-lock.yaml). Pinned to
-# the same version the repo's own Dockerfile pins, so the lockfile is read by
-# the resolver it was written for. `npm install -g` lands it in /usr/local/bin,
-# which is on e2b's forced PATH.
+# Pinned to the version the repo's own Dockerfile pins, so the lockfile is read
+# by the resolver it was written for.
 RUN npm install -g pnpm@10.15.1
 
-# The sandbox may run git as a different user than built this image; without
-# this every git command in /code aborts with "detected dubious ownership".
 RUN git config --system --add safe.directory /code
 
-# ---------------------------------------------------------------------------
-# Clone the repo Aviator is connected to
-# ---------------------------------------------------------------------------
-# The URL must match the connected repo (aviator-co/umami). Aviator compares
-# /code's origin against the repo name; on a mismatch it does NOT error — it
-# deletes /code and re-clones, discarding everything baked below and making
-# every preview permanently slow, with nothing in the logs to explain it.
-#
-# --filter=blob:none keeps the clone small while preserving the full ref
-# namespace. Deliberately NOT --depth 1 / --single-branch: those rewrite
-# remote.origin.fetch to track only the default branch, so Aviator's later
-# `git fetch origin <runbook-branch>` never creates origin/<branch> and the
-# checkout fails with "invalid reference".
+# The URL must match the connected repo. On a mismatch Aviator does not error —
+# it deletes /code and re-clones, silently discarding everything baked below.
+# --filter=blob:none, never --depth 1 / --single-branch: those track only the
+# default branch, so fetching the runbook branch later fails.
 RUN git clone --filter=blob:none https://github.com/aviator-co/umami.git /code
 
 WORKDIR /code
 
-# Record the baked commit OUTSIDE /code — a marker inside would be untracked,
-# not gitignored, and deleted by the launch's `git clean -fd`. The setup script
-# diffs the runbook branch against this to decide what actually needs redoing.
+# Outside /code — a marker inside would be untracked and deleted by the clean.
 RUN git -C /code rev-parse HEAD > /preview-image-sha
 
-# ---------------------------------------------------------------------------
-# Build-time environment
-# ---------------------------------------------------------------------------
-# e2b passes ENV vars through to RUN steps here, but does NOT carry them into
-# the sandbox at RUN TIME — the setup script re-exports every one of these.
-# (PATH is the one exception in the other direction: e2b forces its own and
-# ignores any ENV PATH set here.)
-#
-# DATABASE_URL is needed by prisma.config.ts at generate time. It is a real URL
-# rather than the dummy the repo's Dockerfile uses, because the same value drives
-# the migrate + seed step further down.
+# e2b passes these to build steps but does NOT carry them into the sandbox at run
+# time, so the setup script re-exports them. (PATH is the exception: e2b forces
+# its own and ignores any ENV PATH here.)
 ENV DATABASE_URL="postgresql://umami:umami@127.0.0.1:5432/umami"
 ENV APP_SECRET="aviator-preview"
 ENV NEXT_TELEMETRY_DISABLED=1
 ENV DISABLE_TELEMETRY=1
-# e2b builds templates at 4 CPU / 4 GB, and boots the preview sandbox with the
-# same shape. On a 4 GB box Node sizes its default old-space at roughly 2 GB,
-# which a Next.js build of this size can run into. Raise the ceiling while
-# staying under total RAM — the repo's own Dockerfile exposes NODE_OPTIONS as a
-# build arg for the same reason.
+# 4 GB box; Node's default old-space (~2 GB) can be tight for this build.
 ENV NODE_OPTIONS="--max-old-space-size=3584"
 
-# ---------------------------------------------------------------------------
-# Dependencies
-# ---------------------------------------------------------------------------
-# node_modules is gitignored, so this survives the launch clean. pnpm-workspace's
-# `allowBuilds` lets the @prisma/engines postinstall run, which downloads the
-# query engine — so this step needs network.
 RUN pnpm install --frozen-lockfile
 
-# ---------------------------------------------------------------------------
-# Build the artifacts a preview should not have to rebuild
-# ---------------------------------------------------------------------------
-# Each of these writes to a gitignored path, so it survives the launch clean and
-# the setup script only redoes the ones the branch actually touched.
-#
-#   build-db       prisma generate -> src/generated, then esbuild-bundled to
-#                  generated/prisma/client.js
-#   build-tracker  rollup src/tracker/index.js  -> public/script.js
-#   build-recorder rollup src/recorder/index.js -> public/recorder.js
-#   build-geo      downloads GeoLite2-City.mmdb -> geo/ (network; the setup
-#                  script never repeats it while geo/ exists)
+# Each writes to a gitignored path, so the setup script only redoes what the
+# branch actually changed. build-geo downloads GeoLite2-City.mmdb (needs network).
 RUN pnpm build-db
 RUN pnpm build-tracker
 RUN pnpm build-recorder
 RUN pnpm build-geo
 
-# The Next.js production build. This is the expensive one and the reason the
-# image exists. No database is required — the repo's own Dockerfile builds
-# against a dummy DATABASE_URL — so this can run before postgres is up.
-# It writes .next/ (gitignored), including .next/cache, which is what makes the
-# per-preview rebuild incremental.
+# The expensive one, and the reason this image exists. Needs no database.
 RUN pnpm build-app
 
-# ---------------------------------------------------------------------------
-# PostgreSQL: create the cluster, migrate, and seed demo analytics
-# ---------------------------------------------------------------------------
-# One RUN layer, because the server has to be up for the middle of it.
+# PostgreSQL: create the cluster, migrate, seed demo analytics. One RUN layer,
+# because the server has to be up for the middle of it. An empty umami renders
+# "no data" everywhere; seed-data.ts creates "Demo Blog" and "Demo SaaS" with
+# sessions, events and revenue.
 #
-# Everything here lands under /var/lib/postgresql — outside /code, so the launch
-# clean cannot reach it. That is what lets a preview boot with a migrated schema
-# and 30 days of realistic traffic already in place.
-#
-# An empty umami is close to unverifiable: every dashboard, chart, funnel and
-# report renders "no data". scripts/seed-data.ts creates two websites,
-# "Demo Blog" (blog.example.com) and "Demo SaaS" (app.example.com), with
-# sessions, events, revenue and geography.
-#
-# The cluster version is discovered rather than hardcoded so a base-image bump
-# to a newer Debian does not silently break the start path.
+# --skip-systemctl-redirect is required on BOTH calls. Debian's pg_ctlcluster
+# hands the action to `systemctl start postgresql@<ver>-main` when
+# /run/systemd/system exists and it was not run from init
+# (/usr/bin/pg_ctlcluster:376), and that unit cannot come up in e2b's builder.
+# Older e2b builders lacked systemd so this used to pass; `docker build` never
+# hits it either, because each RUN is PID 1 there and getppid()==1 suppresses
+# the redirect on its own. The flag makes the behaviour the same everywhere.
 RUN set -eux; \
     mkdir -p /var/run/postgresql; \
     chown postgres:postgres /var/run/postgresql; \
     PGVER="$(ls /etc/postgresql | sort -V | tail -1)"; \
     if [ ! -d "/etc/postgresql/${PGVER}/main" ]; then pg_createcluster "${PGVER}" main; fi; \
-    pg_ctlcluster "${PGVER}" main start; \
+    pg_ctlcluster --skip-systemctl-redirect "${PGVER}" main start; \
     echo "CREATE ROLE umami LOGIN PASSWORD 'umami' SUPERUSER;" | su postgres -c "psql -v ON_ERROR_STOP=1"; \
     su postgres -c "createdb -O umami umami"; \
     pnpm exec prisma migrate deploy; \
     (pnpm exec tsx scripts/seed-data.ts --days 30 || echo "WARN: seed-data failed; the setup script will retry at launch"); \
-    pg_ctlcluster "${PGVER}" main stop
-# ^ The explicit stop matters: a cluster still running when the layer is
-#   snapshotted leaves a postmaster.pid whose recorded PID may be reused in the
-#   booted sandbox, which makes pg_ctlcluster refuse to start. The setup script
-#   clears a stale pid file defensively, but a clean shutdown here means it
-#   never has to.
+    pg_ctlcluster --skip-systemctl-redirect "${PGVER}" main stop
+# The explicit stop matters: a cluster still running when the layer is
+# snapshotted leaves a postmaster.pid whose PID may be live in the booted
+# sandbox, which makes the next start refuse.
 
-# Where the setup script writes the app log. Created here so a failure to write
-# it is not the first thing that goes wrong at launch.
 RUN mkdir -p /var/log/app
