@@ -76,11 +76,24 @@ RUN pnpm build-app
 # Older e2b builders lacked systemd so this used to pass; `docker build` never
 # hits it either, because each RUN is PID 1 there and getppid()==1 suppresses
 # the redirect on its own. The flag makes the behaviour the same everywhere.
+#
+# `ssl = off` is also required. Debian ships the cluster with ssl = on pointing
+# at /etc/ssl/certs/ssl-cert-snakeoil.pem, and that file does NOT survive e2b's
+# layer cache — a fresh build has it (apt just made it), a cached build does
+# not, so postgres refuses to start with "could not load server certificate
+# file". Nothing but this box connects to this database, so TLS buys nothing.
+# conf.d is already active via `include_dir` and wins over the earlier ssl = on.
+#
+# The stale postmaster.pid removal covers "lock file is empty", left behind when
+# an earlier build attempt died mid-start.
 RUN set -eux; \
     mkdir -p /var/run/postgresql; \
     chown postgres:postgres /var/run/postgresql; \
     PGVER="$(ls /etc/postgresql | sort -V | tail -1)"; \
     if [ ! -d "/etc/postgresql/${PGVER}/main" ]; then pg_createcluster "${PGVER}" main; fi; \
+    mkdir -p "/etc/postgresql/${PGVER}/main/conf.d"; \
+    printf 'ssl = off\n' > "/etc/postgresql/${PGVER}/main/conf.d/99-preview.conf"; \
+    rm -f "/var/lib/postgresql/${PGVER}/main/postmaster.pid"; \
     pg_ctlcluster --skip-systemctl-redirect "${PGVER}" main start; \
     echo "CREATE ROLE umami LOGIN PASSWORD 'umami' SUPERUSER;" | su postgres -c "psql -v ON_ERROR_STOP=1"; \
     su postgres -c "createdb -O umami umami"; \
