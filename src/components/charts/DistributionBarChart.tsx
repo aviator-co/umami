@@ -41,8 +41,8 @@ function DistributionBarChartComponent({
   labels,
   datasets,
   height = '320px',
-  backgroundColor = 'rgba(59, 130, 246, 0.75)',
-  borderColor = 'rgba(59, 130, 246, 0.95)',
+  backgroundColor = 'rgba(229, 57, 53, 0.75)',
+  borderColor = 'rgba(229, 57, 53, 0.95)',
   stacked = false,
   horizontal = true,
 }: DistributionBarChartProps) {
